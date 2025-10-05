@@ -24,11 +24,32 @@ err() { echo "${red}[ERROR]${end} $*"; }
 command -v ip >/dev/null 2>&1 || { err "'ip' command not found"; exit 1; }
 
 has_global_ipv6() {
-  # Returns 0 if any global IPv6 address is present on any interface
-  # Excludes link-local (fe80::/10). ULAs (fc00::/7) may appear as scope global;
-  # we still treat presence of any global-scope IPv6 as 'available' for Nginx config.
-  ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | grep -vq '^fe80' \
-    && return 0 || return 1
+  # Returns 0 if any publicly routable IPv6 address is present on any interface
+  # Excludes link-local (fe80::/10) and unique local addresses (fc00::/7).
+  mapfile -t addresses < <(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}')
+  if ((${#addresses[@]} == 0)); then
+    return 1
+  fi
+
+  local addr lowered found_ula=0
+  for addr in "${addresses[@]}"; do
+    lowered="${addr%%/*}"
+    lowered="${lowered,,}"
+    [[ -z "$lowered" ]] && continue
+    if [[ "$lowered" == fe80* ]]; then
+      continue
+    fi
+    if [[ "$lowered" == fc* || "$lowered" == fd* ]]; then
+      found_ula=1
+      continue
+    fi
+    return 0
+  done
+
+  if ((found_ula)); then
+    warn "Only unique local IPv6 addresses (fc00::/7) detected; public IPv6 is not configured."
+  fi
+  return 1
 }
 
 nginx_installed() { command -v nginx >/dev/null 2>&1; }
@@ -87,9 +108,73 @@ ensure_ufw_http_https_allowed() {
 ensure_ipv6_listen_in_file() {
   local f="$1"
   [[ -f "$f" ]] || return 0
-  # Add IPv6 listeners if missing
-  grep -qE "^\s*listen\s*\[::\]:80;" "$f" || sed -i '/^\s*listen\s*80;\s*$/a \    listen [::]:80;' "$f"
-  grep -qE "^\s*listen\s*\[::\]:443\s*ssl\s*http2;" "$f" || sed -i '/^\s*listen\s*443\s*ssl\s*http2;\s*$/a \    listen [::]:443 ssl http2;' "$f"
+
+  local python_bin=""
+  if command -v python3 >/dev/null 2>&1; then
+    python_bin="python3"
+  elif command -v python >/dev/null 2>&1; then
+    python_bin="python"
+  else
+    warn "Python is required to adjust IPv6 listeners in $f but was not found."
+    return 1
+  fi
+
+  "$python_bin" <<'PY' "$f"
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+lines = text.splitlines()
+
+
+def ensure_port(port, current_lines):
+    ipv4_pattern = re.compile(r'^(\s*)listen\s+(?:[0-9.*:]*:)?' + port + r'\b([^;]*);', re.IGNORECASE)
+    ipv6_pattern = re.compile(r'^\s*listen\s*\[::\]\s*:' + port + r'\b', re.IGNORECASE)
+    new_lines = []
+    changed = False
+    depth = 0
+
+    for idx, line in enumerate(current_lines):
+        line_depth = depth
+        new_lines.append(line)
+        match = ipv4_pattern.match(line)
+        if match:
+            indent, extras = match.groups()
+            extras = extras.strip()
+            has_ipv6 = False
+            temp_depth = line_depth
+            j = idx + 1
+            while j < len(current_lines):
+                next_line = current_lines[j]
+                next_depth = temp_depth
+                if next_depth < line_depth:
+                    break
+                if ipv6_pattern.match(next_line) and next_depth == line_depth:
+                    has_ipv6 = True
+                    break
+                temp_depth += next_line.count('{') - next_line.count('}')
+                j += 1
+            if not has_ipv6:
+                new_line = f"{indent}listen [::]:{port}"
+                if extras:
+                    new_line += f" {extras}"
+                new_line += ";"
+                new_lines.append(new_line)
+                changed = True
+        depth += line.count('{') - line.count('}')
+
+    return new_lines, changed
+
+
+lines, changed80 = ensure_port('80', lines)
+lines, changed443 = ensure_port('443', lines)
+
+if changed80 or changed443:
+    ending = '\n' if text.endswith('\n') else ''
+    Path(sys.argv[1]).write_text('\n'.join(lines) + ending)
+PY
 }
 
 # List all site config files in /etc/nginx/sites-available
@@ -167,8 +252,35 @@ configure_nginx_ipv6() {
   fi
 
   if nginx -t; then
-    systemctl reload nginx || true
-    ok "Nginx reloaded with IPv6 listeners"
+    local reload_ok=0
+    if command -v systemctl >/dev/null 2>&1; then
+      if systemctl reload nginx >/dev/null 2>&1; then
+        reload_ok=1
+      else
+        warn "systemctl reload nginx failed; attempting fallback methods..."
+      fi
+    else
+      info "systemctl not available; attempting alternative reload methods..."
+    fi
+
+    if ((reload_ok == 0)) && command -v service >/dev/null 2>&1; then
+      if service nginx reload >/dev/null 2>&1; then
+        reload_ok=1
+      fi
+    fi
+
+    if ((reload_ok == 0)) && command -v nginx >/dev/null 2>&1; then
+      if nginx -s reload >/dev/null 2>&1; then
+        reload_ok=1
+      fi
+    fi
+
+    if ((reload_ok)); then
+      ok "Nginx reloaded with IPv6 listeners"
+    else
+      warn "Failed to reload Nginx automatically. Please reload Nginx manually."
+      return 1
+    fi
   else
     err "nginx -t failed; please review your configs"
     return 1
@@ -254,7 +366,7 @@ main() {
     echo "${yel}Action required:${end} Obtain an IPv6 address/prefix from your cloud provider and configure it on the server (Netplan/ifupdown)."
     echo "Once IPv6 is configured, re-run this menu to set up Nginx."
     echo "If you use Cloudflare (DNS-only), don’t forget to add an AAAA record with your server’s IPv6 address."
-    exit 0
+    return 0
   fi
 
   ok "Global IPv6 detected."
@@ -263,7 +375,7 @@ main() {
     show_menu
     case "$choice" in
       1)
-        configure_nginx_ipv6 || exit 1
+        configure_nginx_ipv6 || return 1
         # Check UFW after configuration
         if ufw_installed; then
           if ufw_active; then
@@ -287,7 +399,7 @@ main() {
         ;;
       4)
         echo "${grn}Exiting.${end}"
-        exit 0
+        break
         ;;
       *)
         warn "Invalid choice. Please select 1, 2, 3, or 4."
@@ -296,6 +408,7 @@ main() {
     echo ""
     read -r -p "${cyn}Press Enter to return to the menu...${end}"
   done
+  return 0
 }
 
 main
