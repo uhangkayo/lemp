@@ -599,6 +599,7 @@ gen_nginx_server_block() {
   cat > "$conf" <<NGX
 server {
     listen 80;
+    listen [::]:80;
     server_name ${site};
     root ${root};
     index index.php index.html;
