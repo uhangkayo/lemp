@@ -130,40 +130,96 @@ lines = text.splitlines()
 
 
 def ensure_port(port, current_lines):
-    ipv4_pattern = re.compile(r'^(\s*)listen\s+(?:[0-9.*:]*:)?' + port + r'\b([^;]*);', re.IGNORECASE)
+    ipv4_pattern = re.compile(r'^(\s*)listen\s+((?:[0-9.*:]*:)?' + port + r')\b([^;]*);', re.IGNORECASE)
     ipv6_pattern = re.compile(r'^\s*listen\s*\[::\]\s*:' + port + r'\b', re.IGNORECASE)
+    ipv6_cleanup_pattern = re.compile(r'^(\s*)listen\s*\[::\]\s*:' + port + r'\b([^;]*);', re.IGNORECASE)
+    http2_pattern = re.compile(r'^\s*http2\s+on\s*;', re.IGNORECASE)
+
     new_lines = []
     changed = False
     depth = 0
+    http2_added_by_depth = {}
 
     for idx, line in enumerate(current_lines):
         line_depth = depth
-        new_lines.append(line)
+
+        if port == '443':
+            ipv6_match = ipv6_cleanup_pattern.match(line)
+            if ipv6_match:
+                indent, extras = ipv6_match.groups()
+                extras_tokens = extras.split()
+                filtered_tokens = [tok for tok in extras_tokens if tok.lower() != 'http2']
+                if len(filtered_tokens) != len(extras_tokens):
+                    cleaned = ' '.join(filtered_tokens)
+                    line = f"{indent}listen [::]:{port}"
+                    if cleaned:
+                        line += f" {cleaned}"
+                    line += ';'
+                    changed = True
+
+        if http2_pattern.match(line):
+            http2_added_by_depth[line_depth] = True
+
         match = ipv4_pattern.match(line)
         if match:
-            indent, extras = match.groups()
-            extras = extras.strip()
-            has_ipv6 = False
+            indent, host_port, extras = match.groups()
+            extras_tokens = extras.split()
+            filtered_tokens = []
+            removed_http2 = False
+            for tok in extras_tokens:
+                if tok.lower() == 'http2':
+                    removed_http2 = True
+                elif tok:
+                    filtered_tokens.append(tok)
+            cleaned_extras = ' '.join(filtered_tokens)
+
+            new_line = f"{indent}listen {host_port}"
+            if cleaned_extras:
+                new_line += f" {cleaned_extras}"
+            new_line += ';'
+
+            if new_line != line:
+                changed = True
+
+            new_lines.append(new_line)
+
             temp_depth = line_depth
             j = idx + 1
+            has_ipv6 = False
+            http2_exists = http2_added_by_depth.get(line_depth, False)
+
             while j < len(current_lines):
                 next_line = current_lines[j]
                 next_depth = temp_depth
                 if next_depth < line_depth:
                     break
-                if ipv6_pattern.match(next_line) and next_depth == line_depth:
+                if not has_ipv6 and ipv6_pattern.match(next_line) and next_depth == line_depth:
                     has_ipv6 = True
+                if port == '443' and not http2_exists and http2_pattern.match(next_line) and next_depth == line_depth:
+                    http2_exists = True
+                if has_ipv6 and (port != '443' or http2_exists):
                     break
                 temp_depth += next_line.count('{') - next_line.count('}')
                 j += 1
+
             if not has_ipv6:
-                new_line = f"{indent}listen [::]:{port}"
-                if extras:
-                    new_line += f" {extras}"
-                new_line += ";"
-                new_lines.append(new_line)
+                ipv6_line = f"{indent}listen [::]:{port}"
+                if cleaned_extras:
+                    ipv6_line += f" {cleaned_extras}"
+                ipv6_line += ';'
+                new_lines.append(ipv6_line)
                 changed = True
+
+            if port == '443' and removed_http2 and not http2_exists:
+                http2_line = f"{indent}http2 on;"
+                new_lines.append(http2_line)
+                http2_added_by_depth[line_depth] = True
+                changed = True
+        else:
+            new_lines.append(line)
+
         depth += line.count('{') - line.count('}')
+        http2_added_by_depth = {d: v for d, v in http2_added_by_depth.items() if d <= depth}
 
     return new_lines, changed
 
