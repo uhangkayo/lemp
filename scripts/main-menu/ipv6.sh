@@ -119,7 +119,7 @@ ensure_ipv6_listen_in_file() {
     return 1
   fi
 
-  "$python_bin" <<'PY' "$f"
+  "$python_bin" - "$f" <<'PY'
 import re
 import sys
 from pathlib import Path
