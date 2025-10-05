@@ -2,7 +2,9 @@ fastcgi_cache_path /etc/nginx/mycache/domain.com levels=1:2 keys_zone=domain.com
 
 server {
   listen 80;
+  listen [::]:80;
   listen 443 ssl http2;
+  listen [::]:443 ssl http2;
   ssl_certificate /etc/ssl/domain.com/domain.com.crt;
   ssl_certificate_key /etc/ssl/domain.com/domain.com.key;
   root /var/www/domain.com;
