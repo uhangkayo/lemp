@@ -110,11 +110,14 @@ ensure_ipv6_listen_in_file() {
   [[ -f "$f" ]] || return 0
 
   local python_bin=""
-  if command -v python3 >/dev/null 2>&1; then
-    python_bin="python3"
-  elif command -v python >/dev/null 2>&1; then
-    python_bin="python"
-  else
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      python_bin="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$python_bin" ]]; then
     warn "Python is required to adjust IPv6 listeners in $f but was not found."
     return 1
   fi
