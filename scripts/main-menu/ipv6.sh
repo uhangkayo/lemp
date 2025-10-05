@@ -139,9 +139,11 @@ def ensure_port(port, current_lines):
     changed = False
     depth = 0
     http2_added_by_depth = {}
+    http2_pending_by_depth = {}
 
     for idx, line in enumerate(current_lines):
         line_depth = depth
+        http2_removed_on_this_line = False
 
         if port == '443':
             ipv6_match = ipv6_cleanup_pattern.match(line)
@@ -156,9 +158,12 @@ def ensure_port(port, current_lines):
                         line += f" {cleaned}"
                     line += ';'
                     changed = True
+                    http2_pending_by_depth.setdefault(line_depth, indent)
+                    http2_removed_on_this_line = True
 
         if http2_pattern.match(line):
             http2_added_by_depth[line_depth] = True
+            http2_pending_by_depth.pop(line_depth, None)
 
         match = ipv4_pattern.match(line)
         if match:
@@ -182,6 +187,10 @@ def ensure_port(port, current_lines):
                 changed = True
 
             new_lines.append(new_line)
+
+            if port == '443' and removed_http2:
+                http2_pending_by_depth.setdefault(line_depth, indent)
+                http2_removed_on_this_line = True
 
             temp_depth = line_depth
             j = idx + 1
@@ -209,17 +218,48 @@ def ensure_port(port, current_lines):
                 ipv6_line += ';'
                 new_lines.append(ipv6_line)
                 changed = True
+                if port == '443':
+                    http2_pending_by_depth.setdefault(line_depth, indent)
+                    http2_removed_on_this_line = True
 
-            if port == '443' and removed_http2 and not http2_exists:
-                http2_line = f"{indent}http2 on;"
-                new_lines.append(http2_line)
-                http2_added_by_depth[line_depth] = True
-                changed = True
+            if port == '443':
+                if http2_exists:
+                    http2_pending_by_depth.pop(line_depth, None)
+                elif http2_pending_by_depth.get(line_depth):
+                    http2_line = f"{http2_pending_by_depth.pop(line_depth)}http2 on;"
+                    new_lines.append(http2_line)
+                    http2_added_by_depth[line_depth] = True
+                    changed = True
         else:
             new_lines.append(line)
 
+            if port == '443' and http2_removed_on_this_line:
+                http2_exists = http2_added_by_depth.get(line_depth, False)
+                if not http2_exists:
+                    temp_depth = line_depth
+                    j = idx + 1
+                    while j < len(current_lines):
+                        next_line = current_lines[j]
+                        next_depth = temp_depth
+                        if next_depth < line_depth:
+                            break
+                        if next_depth == line_depth and http2_pattern.match(next_line):
+                            http2_exists = True
+                            break
+                        temp_depth += next_line.count('{') - next_line.count('}')
+                        j += 1
+
+                if http2_exists:
+                    http2_pending_by_depth.pop(line_depth, None)
+                elif http2_pending_by_depth.get(line_depth):
+                    http2_line = f"{http2_pending_by_depth.pop(line_depth)}http2 on;"
+                    new_lines.append(http2_line)
+                    http2_added_by_depth[line_depth] = True
+                    changed = True
+
         depth += line.count('{') - line.count('}')
         http2_added_by_depth = {d: v for d, v in http2_added_by_depth.items() if d <= depth}
+        http2_pending_by_depth = {d: v for d, v in http2_pending_by_depth.items() if d <= depth}
 
     return new_lines, changed
 
